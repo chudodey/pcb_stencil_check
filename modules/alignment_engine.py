@@ -4,12 +4,13 @@ from typing import Dict, Tuple, List
 import math
 import logging
 from datetime import datetime
-from sklearn.neighbors import KDTree
+from scipy.spatial import cKDTree
+from scipy.stats import pearsonr
 
 class AlignmentEngine:
     """
-    Оптимизированный выравниватель изображений с исправленными ошибками.
-    Версия 2.1 с исправлениями на основе анализа логов.
+    Комбинированный выравниватель изображений.
+    Версия 5.0 - объединяет два подхода для максимальной надежности.
     """
 
     def __init__(self, dpi: int = 600, ransac_threshold: float = 1.5,
@@ -22,7 +23,7 @@ class AlignmentEngine:
 
         # Настройка логирования
         self.debug = debug
-        self.logger = logging.getLogger('AlignmentEngine')
+        self.logger = logging.getLogger('CombinedAlignmentEngine')
         self.logger.setLevel(logging.DEBUG if debug else logging.WARNING)
         
         if debug:
@@ -34,268 +35,403 @@ class AlignmentEngine:
             
             self.logger.info(f"Инициализация движка с параметрами: {self.params}")
 
-        self._init_transforms()
-
-    def _init_transforms(self) -> None:
-        """Инициализация преобразований с исправленными матрицами."""
-        self._orientations = {
-            '0°': None,
-            '90°': cv2.ROTATE_90_CLOCKWISE,
-            '180°': cv2.ROTATE_180,
-            '270°': cv2.ROTATE_90_COUNTERCLOCKWISE,
-            'flip_h': lambda img: cv2.flip(img, 1),
-            'flip_v': lambda img: cv2.flip(img, 0)
-        }
-
-    def _get_contours(self, image: np.ndarray, name: str = "Изображение") -> Tuple[np.ndarray, np.ndarray]:
-        """Извлечение контуров с исправленной обработкой моментов."""
-        start_time = datetime.now()
-        contours, _ = cv2.findContours(
-            image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+    def _transform_image_simple(self, image: np.ndarray, rotate: int = 0, flip: int = None) -> np.ndarray:
+        """Простое преобразование изображения (для подхода 1)."""
+        result = image.copy()
         
-        centroids = []
-        areas = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area >= self.params['min_contour_area']:
-                M = cv2.moments(cnt)
-                if M['m00'] > 0:
-                    cx = M['m10'] / M['m00']
-                    cy = M['m01'] / M['m00']
-                    centroids.append([cx, cy])
-                    areas.append(area)
+        # Поворот
+        if rotate == 90:
+            result = cv2.rotate(result, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif rotate == -90:
+            result = cv2.rotate(result, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate == 180:
+            result = cv2.rotate(result, cv2.ROTATE_180)
+        
+        # Отражение (если указано)
+        if flip is not None:
+            result = cv2.flip(result, flip)
+        
+        return result
 
+    def _transform_image_matrix(self, image: np.ndarray, rotate: int = 0, flip: int = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Преобразование с возвратом матрицы (для подхода 2)."""
+        h, w = image.shape
+        M_flip = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        
+        if flip is not None:
+            if flip == 1:  # горизонтальное отражение
+                M_flip = np.array([[-1, 0, w-1], [0, 1, 0]], dtype=np.float32)
+            elif flip == 0:  # вертикальное отражение
+                M_flip = np.array([[1, 0, 0], [0, -1, h-1]], dtype=np.float32)
+
+        M_rotate = cv2.getRotationMatrix2D((w / 2, h / 2), -rotate, 1.0)
+        
+        # Объединяем матрицы
+        M_total = M_rotate @ np.vstack([M_flip, [0, 0, 1]])
+        M_total = M_total[:2, :]
+        
+        result = cv2.warpAffine(image, M_total, (w, h))
+        
+        return result, M_total
+
+    def _get_centroids(self, contours: List[np.ndarray]) -> np.ndarray:
+        """Вычисление центроидов контуров."""
+        centers = []
+        for cnt in contours:
+            M = cv2.moments(cnt)
+            if M['m00'] > 0:
+                cx = M['m10'] / M['m00']
+                cy = M['m01'] / M['m00']
+                centers.append([cx, cy])
+        return np.array(centers, dtype=np.float32)
+
+    def _extract_contours_and_centroids(self, image: np.ndarray, name: str = "") -> Tuple[List, np.ndarray]:
+        """Извлечение контуров и центроидов из бинарного изображения."""
+        contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Фильтрация по площади
+        h, w = image.shape
+        max_area = h * w * 0.1
+        min_area = self.params['min_contour_area']
+        
+        valid_contours = [
+            cnt for cnt in contours 
+            if min_area < cv2.contourArea(cnt) < max_area
+        ]
+        
+        centroids = self._get_centroids(valid_contours)
+        
         if self.debug:
-            elapsed = (datetime.now() - start_time).total_seconds() * 1000
             self.logger.debug(
                 f"{name}: найдено {len(contours)} контуров, "
-                f"оставлено {len(centroids)} после фильтрации "
-                f"({elapsed:.2f} мс)"
+                f"валидных {len(valid_contours)}, центроидов {len(centroids)}"
             )
-            if len(centroids) > 0:
-                self.logger.debug(
-                    f"{name}: площади от {np.min(areas):.1f} до {np.max(areas):.1f}"
-                )
-                
-        return np.array(centroids), np.array(areas)
-
-    def _apply_orientation(self, points: np.ndarray, orientation: str, 
-                         img_shape: Tuple[int, int]) -> np.ndarray:
-        """Применение ориентации к точкам с исправленной логикой."""
-        if orientation == '0°' or points.size == 0:
-            return points.copy()
             
-        if orientation == 'flip_h':
-            points[:, 0] = img_shape[1] - points[:, 0]
-            return points
-        elif orientation == 'flip_v':
-            points[:, 1] = img_shape[0] - points[:, 1]
-            return points
-            
-        # Для поворотов используем матрицы преобразований
-        center = (img_shape[1]/2, img_shape[0]/2)
-        angle = float(orientation[:-1])
+        return valid_contours, centroids
+
+    def _match_and_estimate(self, scan_centroids: np.ndarray, ref_centroids: np.ndarray) -> Tuple[np.ndarray, int, float]:
+        """Сопоставление точек и оценка преобразования."""
+        if len(scan_centroids) == 0 or len(ref_centroids) == 0:
+            return None, 0, float('inf')
         
-        if orientation == '90°':
-            M = cv2.getRotationMatrix2D(center, -90, 1.0)
-        elif orientation == '180°':
-            M = cv2.getRotationMatrix2D(center, 180, 1.0)
-        elif orientation == '270°':
-            M = cv2.getRotationMatrix2D(center, 90, 1.0)
-        else:
-            return points.copy()
-            
-        # Преобразование точек
-        homogeneous = np.column_stack([points, np.ones(len(points))])
-        return (M @ homogeneous.T).T
-
-    def _match_points(self, ref_points: np.ndarray, scan_points: np.ndarray) -> np.ndarray:
-        """Улучшенный матчинг точек с автоматическим подбором порога."""
-        if len(scan_points) == 0 or len(ref_points) == 0:
-            return np.empty((0, 2), dtype=int)
-
-        tree = KDTree(ref_points)
-        distances, indices = tree.query(scan_points, k=1)
+        # Сопоставление точек с помощью KD-дерева
+        tree = cKDTree(ref_centroids)
+        distances, indices = tree.query(scan_centroids, k=1)
         
-        # Автоподбор порога на основе медианного расстояния
-        median_dist = np.median(distances)
-        max_dist = max(median_dist * 2, 10.0)  # Минимальный порог 10px
+        matched_ref = ref_centroids[indices]
+        matched_scan = scan_centroids
         
-        valid = distances[:, 0] < max_dist
-        matches = np.column_stack([
-            indices[valid, 0],
-            np.arange(len(scan_points))[valid]
-        ])
-
-        if self.debug:
-            self.logger.debug(
-                f"Матчинг: {len(matches)} соответствий из {len(scan_points)} "
-                f"(порог расстояния {max_dist:.1f} px)"
-            )
-
-        return matches
-
-    def _estimate_transform(self, src_points: np.ndarray, dst_points: np.ndarray) -> Tuple[np.ndarray, int]:
-        """Оценка преобразования с улучшенной обработкой ошибок."""
-        if len(src_points) < 3:
-            return None, 0
-
+        # RANSAC
         try:
-            M, inliers = cv2.estimateAffine2D(
-                src_points, dst_points,
+            affine_matrix, inliers = cv2.estimateAffinePartial2D(
+                matched_scan,
+                matched_ref,
                 method=cv2.RANSAC,
                 ransacReprojThreshold=self.params['ransac_threshold'],
+                maxIters=5000,
                 confidence=0.999,
-                maxIters=5000
+                refineIters=20
             )
-            return M, np.sum(inliers) if inliers is not None else 0
-        except cv2.error as e:
+            
+            if affine_matrix is not None and inliers is not None:
+                inliers_count = np.sum(inliers)
+                
+                # Вычисление средней ошибки для инлайнеров
+                if inliers_count > 0:
+                    inlier_scan = matched_scan[inliers.flatten().astype(bool)]
+                    inlier_ref = matched_ref[inliers.flatten().astype(bool)]
+                    
+                    # Применяем преобразование к инлайнерам скана
+                    transformed = cv2.transform(
+                        inlier_scan.reshape(-1, 1, 2), 
+                        affine_matrix
+                    ).reshape(-1, 2)
+                    
+                    # Вычисляем среднюю ошибку
+                    errors = np.linalg.norm(transformed - inlier_ref, axis=1)
+                    mean_error = np.mean(errors)
+                else:
+                    mean_error = float('inf')
+                
+                return affine_matrix, inliers_count, mean_error
+            else:
+                return None, 0, float('inf')
+                
+        except Exception as e:
             if self.debug:
                 self.logger.warning(f"Ошибка RANSAC: {str(e)}")
-            return None, 0
+            return None, 0, float('inf')
 
-    def align(self, reference: np.ndarray, scan: np.ndarray) -> Dict:
-        """Основной метод с исправленной обработкой ошибок."""
+    def _approach_1_transform_scan(self, reference: np.ndarray, scan: np.ndarray) -> Dict:
+        """
+        Подход 1: Трансформируем скан (как в версии 3.0).
+        """
         if self.debug:
-            self.logger.info(f"Начало выравнивания. Размеры: эталон {reference.shape}, скан {scan.shape}")
+            self.logger.info("Подход 1: Трансформация скана")
+        
+        # Извлечение контуров эталона (один раз)
+        ref_contours, ref_centroids = self._extract_contours_and_centroids(reference, "Эталон")
+        
+        if len(ref_centroids) == 0:
+            return None
 
-        # Извлечение контуров
-        ref_centroids, ref_areas = self._get_contours(reference, "Эталон")
-        scan_centroids, scan_areas = self._get_contours(scan, "Скан")
+        transformations = [
+            (0, None, "0°"),
+            (90, None, "90°"),
+            (180, None, "180°"), 
+            (-90, None, "270°"),
+            (0, 1, "0°+flip_h"),
+            (90, 1, "90°+flip_h"),
+            (180, 1, "180°+flip_h"),
+            (-90, 1, "270°+flip_h"),
+        ]
 
-        best = {
+        best_result = {
             'matrix': None,
             'orientation': None,
             'inliers': -1,
-            'matches': 0,
-            'error': float('inf')
+            'error': float('inf'),
+            'correlation': -1,
+            'transformed_scan': None,
+            'approach': 1
         }
 
-        # Перебор ориентаций
-        for orientation in self._orientations:
-            if self.debug:
-                self.logger.info(f"Проверка ориентации: {orientation}")
-
+        for rotate, flip, orientation_name in transformations:
             try:
-                # Применение ориентации
-                scan_transformed = self._apply_orientation(
-                    scan_centroids, orientation, scan.shape
+                # Трансформация скана
+                scan_transformed = self._transform_image_simple(scan, rotate=rotate, flip=flip)
+                
+                # Извлечение контуров из трансформированного скана
+                scan_contours, scan_centroids = self._extract_contours_and_centroids(
+                    scan_transformed, f"Скан ({orientation_name})"
                 )
-
-                # Матчинг точек
-                matches = self._match_points(ref_centroids, scan_transformed)
-                if len(matches) < 3:
-                    if self.debug:
-                        self.logger.warning(f"Недостаточно соответствий: {len(matches)}")
+                
+                if len(scan_centroids) < 3:
                     continue
 
-                # Оценка преобразования
-                M_affine, inliers = self._estimate_transform(
-                    scan_transformed[matches[:, 1]],
-                    ref_centroids[matches[:, 0]]
+                # RANSAC
+                affine_matrix, inliers_count, mean_error = self._match_and_estimate(
+                    scan_centroids, ref_centroids
                 )
-
-                if M_affine is None or inliers < 3:
-                    if self.debug:
-                        self.logger.warning("RANSAC не нашел решение")
+                
+                if affine_matrix is None or inliers_count < 3:
                     continue
 
-                # Вычисление ошибки
-                aligned_points = cv2.transform(
-                    scan_transformed[matches[:, 1]].reshape(-1, 1, 2),
-                    M_affine
-                ).reshape(-1, 2)
-                error = np.mean(np.linalg.norm(
-                    aligned_points - ref_centroids[matches[:, 0]], axis=1
-                ))
-
-                # Комбинирование преобразований
-                if orientation != '0°':
-                    # Создаем полную матрицу преобразования
-                    M_orient = np.eye(3)
-                    if orientation == 'flip_h':
-                        M_orient[0, 0] = -1
-                        M_orient[0, 2] = scan.shape[1]
-                    elif orientation == 'flip_v':
-                        M_orient[1, 1] = -1
-                        M_orient[1, 2] = scan.shape[0]
-                    else:
-                        angle = float(orientation[:-1])
-                        if orientation == '90°':
-                            angle = -90
-                        elif orientation == '270°':
-                            angle = 90
-                        M_orient[:2] = cv2.getRotationMatrix2D(
-                            (scan.shape[1]/2, scan.shape[0]/2), angle, 1.0
-                        )
-                    
-                    M_affine_ext = np.vstack([M_affine, [0, 0, 1]])
-                    M_total = M_affine_ext @ M_orient
-                    M_total = M_total[:2, :]
-                else:
-                    M_total = M_affine
-
+                # Финальное выравнивание
+                height, width = reference.shape
+                aligned = cv2.warpAffine(scan_transformed, affine_matrix, (width, height))
+                
+                # Корреляция
+                correlation = pearsonr(reference.flatten(), aligned.flatten())[0]
+                
                 if self.debug:
-                    self.logger.info(
-                        f"Ориентация {orientation}: инлайнеров={inliers}, "
-                        f"ошибка={error:.2f} px, совпадений={len(matches)}"
+                    self.logger.debug(
+                        f"Подход 1, {orientation_name}: инлайнеров={inliers_count}, "
+                        f"ошибка={mean_error:.2f}, корреляция={correlation:.4f}"
                     )
 
                 # Обновление лучшего результата
-                if inliers > best['inliers'] or (
-                    inliers == best['inliers'] and error < best['error']
-                ):
-                    best.update(
-                        matrix=M_total,
-                        orientation=orientation,
-                        inliers=inliers,
-                        matches=len(matches),
-                        error=error
-                    )
+                is_better = (
+                    inliers_count > best_result['inliers'] or
+                    (inliers_count == best_result['inliers'] and mean_error < best_result['error']) or
+                    (inliers_count == best_result['inliers'] and mean_error == best_result['error'] and correlation > best_result['correlation'])
+                )
+                
+                if is_better:
+                    best_result.update({
+                        'matrix': affine_matrix,
+                        'orientation': orientation_name,
+                        'inliers': inliers_count,
+                        'error': mean_error,
+                        'correlation': correlation,
+                        'transformed_scan': scan_transformed,
+                        'result_image': aligned
+                    })
 
             except Exception as e:
                 if self.debug:
-                    self.logger.error(f"Ошибка при обработке {orientation}: {str(e)}")
+                    self.logger.error(f"Подход 1, ошибка {orientation_name}: {str(e)}")
                 continue
 
-        # Проверка результата
-        if best['matrix'] is None:
-            if self.debug:
-                self.logger.error("Выравнивание не удалось")
-            raise ValueError("Не удалось найти подходящее преобразование")
+        return best_result if best_result['matrix'] is not None else None
 
-        # Применение преобразования
-        result_img = cv2.warpAffine(
-            scan, best['matrix'], (reference.shape[1], reference.shape[0]),
-            flags=cv2.INTER_NEAREST
-        )
+    def _approach_2_transform_reference(self, reference: np.ndarray, scan: np.ndarray) -> Dict:
+        """
+        Подход 2: Трансформируем эталон (как в версии 4.0, но исправленный).
+        """
+        if self.debug:
+            self.logger.info("Подход 2: Трансформация эталона")
+        
+        # Извлечение контуров скана (один раз)
+        scan_contours, scan_centroids = self._extract_contours_and_centroids(scan, "Скан")
+        
+        if len(scan_centroids) == 0:
+            return None
 
-        # Вычисление корреляции
-        correlation = cv2.matchTemplate(
-            reference.astype(np.float32),
-            result_img.astype(np.float32),
-            cv2.TM_CCOEFF_NORMED
-        )[0][0]
+        transformations = [
+            (0, None, "0°"),
+            (90, None, "90°"),
+            (180, None, "180°"), 
+            (-90, None, "270°"),
+            (0, 1, "0°+flip_h"),
+            (90, 1, "90°+flip_h"),
+            (180, 1, "180°+flip_h"),
+            (-90, 1, "270°+flip_h"),
+        ]
+
+        best_result = {
+            'matrix': None,
+            'orientation': None,
+            'inliers': -1,
+            'error': float('inf'),
+            'correlation': -1,
+            'ref_transformed': None,
+            'ref_transform_matrix': None,
+            'approach': 2
+        }
+
+        for rotate, flip, orientation_name in transformations:
+            try:
+                # Трансформация эталона с получением матрицы
+                ref_transformed, ref_transform_matrix = self._transform_image_matrix(
+                    reference, rotate=rotate, flip=flip
+                )
+                
+                # Извлечение контуров из трансформированного эталона
+                ref_contours, ref_centroids = self._extract_contours_and_centroids(
+                    ref_transformed, f"Эталон ({orientation_name})"
+                )
+                
+                if len(ref_centroids) < 3:
+                    continue
+
+                # RANSAC: скан → трансформированный эталон
+                affine_matrix, inliers_count, mean_error = self._match_and_estimate(
+                    scan_centroids, ref_centroids
+                )
+                
+                if affine_matrix is None or inliers_count < 3:
+                    continue
+
+                # Применение к скану для проверки корреляции
+                height, width = ref_transformed.shape
+                scan_aligned = cv2.warpAffine(scan, affine_matrix, (width, height))
+                
+                # Корреляция
+                correlation = pearsonr(ref_transformed.flatten(), scan_aligned.flatten())[0]
+                
+                if self.debug:
+                    self.logger.debug(
+                        f"Подход 2, {orientation_name}: инлайнеров={inliers_count}, "
+                        f"ошибка={mean_error:.2f}, корреляция={correlation:.4f}"
+                    )
+
+                # Обновление лучшего результата
+                is_better = (
+                    inliers_count > best_result['inliers'] or
+                    (inliers_count == best_result['inliers'] and mean_error < best_result['error']) or
+                    (inliers_count == best_result['inliers'] and mean_error == best_result['error'] and correlation > best_result['correlation'])
+                )
+                
+                if is_better:
+                    best_result.update({
+                        'matrix': affine_matrix,
+                        'orientation': orientation_name,
+                        'inliers': inliers_count,
+                        'error': mean_error,
+                        'correlation': correlation,
+                        'ref_transformed': ref_transformed,
+                        'ref_transform_matrix': ref_transform_matrix,
+                        'scan_aligned': scan_aligned
+                    })
+
+            except Exception as e:
+                if self.debug:
+                    self.logger.error(f"Подход 2, ошибка {orientation_name}: {str(e)}")
+                continue
+
+        # Если найдено решение, вычисляем финальную матрицу
+        if best_result['matrix'] is not None:
+            try:
+                # Исправленная композиция матриц
+                affine_matrix = best_result['matrix']
+                ref_transform_matrix = best_result['ref_transform_matrix']
+                
+                # Вычисляем обратную матрицу для трансформации эталона
+                ref_inverse_matrix = cv2.invertAffineTransform(ref_transform_matrix)
+                
+                # Комбинируем матрицы: сначала RANSAC, потом обратная трансформация эталона
+                final_matrix = ref_inverse_matrix @ np.vstack([affine_matrix, [0, 0, 1]])
+                final_matrix = final_matrix[:2, :]
+                
+                # Применяем к исходному скану
+                height, width = reference.shape
+                result_image = cv2.warpAffine(scan, final_matrix, (width, height))
+                
+                best_result['result_image'] = result_image
+                best_result['final_matrix'] = final_matrix
+                
+            except Exception as e:
+                if self.debug:
+                    self.logger.error(f"Ошибка композиции матриц: {str(e)}")
+                return None
+
+        return best_result if best_result['matrix'] is not None else None
+
+    def align(self, reference: np.ndarray, scan: np.ndarray) -> Dict:
+        """
+        Главный метод выравнивания.
+        Пробует оба подхода и возвращает лучший результат.
+        """
+        if self.debug:
+            self.logger.info(f"Начало комбинированного выравнивания. Размеры: эталон {reference.shape}, скан {scan.shape}")
+
+        # Пробуем подход 1: трансформация скана
+        result_1 = self._approach_1_transform_scan(reference, scan)
+        
+        # Пробуем подход 2: трансформация эталона  
+        result_2 = self._approach_2_transform_reference(reference, scan)
+
+        # Выбираем лучший результат
+        candidates = [r for r in [result_1, result_2] if r is not None]
+        
+        if not candidates:
+            raise ValueError("Оба подхода не смогли найти решение")
+
+        # Сравниваем кандидатов
+        best_result = candidates[0]
+        for candidate in candidates[1:]:
+            is_better = (
+                candidate['inliers'] > best_result['inliers'] or
+                (candidate['inliers'] == best_result['inliers'] and candidate['error'] < best_result['error']) or
+                (candidate['inliers'] == best_result['inliers'] and candidate['error'] == best_result['error'] and candidate['correlation'] > best_result['correlation'])
+            )
+            
+            if is_better:
+                best_result = candidate
 
         if self.debug:
             self.logger.info(
-                f"Лучший результат: ориентация={best['orientation']}, "
-                f"инлайнеров={best['inliers']}, корреляция={correlation:.3f}"
+                f"Лучший результат: подход {best_result['approach']}, "
+                f"ориентация {best_result['orientation']}, "
+                f"инлайнеров={best_result['inliers']}, "
+                f"ошибка={best_result['error']:.2f}, "
+                f"корреляция={best_result['correlation']:.4f}"
             )
 
         return {
-            'result_image': result_img,
+            'result_image': best_result['result_image'],
             'metrics': {
-                'inliers': best['inliers'],
-                'matches': best['matches'],
-                'error': best['error'],
-                'correlation': correlation,
-                'orientation': best['orientation']
+                'inliers': best_result['inliers'],
+                'matches': len(scan) if best_result['approach'] == 2 else len(reference),  # упрощенно
+                'error': best_result['error'],
+                'correlation': best_result['correlation'],
+                'orientation': best_result['orientation'],
+                'approach_used': best_result['approach']
             },
             'debug_info': {
-                'matrix': best['matrix'].tolist(),
-                'ref_contours': len(ref_centroids),
-                'scan_contours': len(scan_centroids)
+                'matrix': best_result['matrix'].tolist(),
+                'approach_used': best_result['approach'],
+                'candidates_tried': len(candidates)
             }
         }
