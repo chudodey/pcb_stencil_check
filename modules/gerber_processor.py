@@ -25,7 +25,8 @@ class Point:
 class Aperture:
     """Апертура из Gerber-файла."""
     code: int
-    type: str  # Тип: 'C' (круг), 'R' (прямоугольник), 'O' (обвод), 'P' (полигон)
+    # Тип: 'C' (круг), 'R' (прямоугольник), 'O' (обвод), 'P' (полигон)
+    type: str
     parameters: List[float]  # Параметры апертуры
 
 
@@ -45,8 +46,6 @@ class GerberProcessor:
 
     def __init__(self, dpi: int = 600, margin_mm: float = 2.0):
         self.params = {
-            'dpi': dpi,
-            'margin_mm': margin_mm,
             'units': 'MM'  # Единицы измерения по умолчанию
         }
         self._reset_state()
@@ -58,7 +57,8 @@ class GerberProcessor:
         self.current_path: List[Point] = []
         self.current_pos = Point(0.0, 0.0)
         self.current_aperture: Optional[int] = None
-        self.format_spec: Dict[str, Tuple[int, int]] = {'x': (3, 3), 'y': (3, 3)}
+        self.format_spec: Dict[str, Tuple[int, int]] = {
+            'x': (3, 3), 'y': (3, 3)}
 
     def parse(self, content: str) -> Dict:
         """
@@ -69,7 +69,6 @@ class GerberProcessor:
 
         Возвращает:
             Словарь с результатами:
-            - result_image (np.ndarray): Растровое изображение платы
             - metrics (dict): Характеристики платы
             - params (dict): Параметры обработки
             - contours (list): Список контуров
@@ -77,12 +76,12 @@ class GerberProcessor:
             - debug_info (dict): Дополнительная информация
         """
         self._reset_state()
-        
+
         # Обработка строк файла
         for line in (l.strip() for l in content.split('\n') if l.strip()):
             self._parse_line(line)
 
-        # >>> РЕШЕНИЕ: Добавьте эту строку, чтобы сохранить последний контур
+        # Сохраняем последний контур
         self._finalize_path()
 
         # Расчет границ платы
@@ -90,36 +89,76 @@ class GerberProcessor:
         width_mm = max(0.0, xmax - xmin)
         height_mm = max(0.0, ymax - ymin)
 
+        # Расчет дополнительных метрик (теперь площади контуров)
+        min_contour_area, max_contour_area, total_area = self._calculate_contour_area_metrics()
+
         return {
-            'result_image': self._rasterize(),
+            'params': self.params,
+            'contours': self.contours,
+            'apertures': self.apertures,
+            'bounds_mm': (xmin, ymin, xmax, ymax),
             'metrics': {
                 'board_width_mm': round(width_mm, 3),
                 'board_height_mm': round(height_mm, 3),
                 'contour_count': len(self.contours),
-                'aperture_count': len(self.apertures)
-            },
-            'params': self.params,
-            'contours': self.contours,
-            'apertures': self.apertures,
-            'debug_info': {
-                'bounds_mm': (xmin, ymin, xmax, ymax)
+                'aperture_count': len(self.apertures),
+                'min_contour_area': round(min_contour_area, 3),
+                'max_contour_area': round(max_contour_area, 3),
+                'total_area_mm2': round(total_area, 3)
             }
         }
 
-    def _rasterize(self) -> np.ndarray:
-        """Преобразование контуров в растровое изображение."""
-        if not self.contours:
-            return np.zeros((100, 100), dtype=np.uint8)
+    def _calculate_contour_area_metrics(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        Вычисляет метрики площадей контуров: минимальная площадь, максимальная площадь и общая площадь.
 
-        bounds = self._calculate_bounds()
-        rasterizer = _GerberRasterizer(self.contours, bounds)
-        return rasterizer.rasterize(self.params['dpi'], self.params['margin_mm'])
+        Returns:
+            Tuple[min_area, max_area, total_area] или (None, None, None) если нет контуров
+        """
+        if not self.contours:
+            return None, None, None
+
+        min_area = float('inf')
+        max_area = 0.0
+        total_area = 0.0
+
+        for contour in self.contours:
+            # Для площади нужно минимум 3 точки
+            if not contour or len(contour) < 3:
+                continue
+
+            # Подготавливаем точки для OpenCV
+            points_for_area = []
+            for point in contour:
+                if hasattr(point, 'x') and hasattr(point, 'y'):
+                    points_for_area.append([point.x, point.y])
+                elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                    points_for_area.append([point[0], point[1]])
+
+            if len(points_for_area) < 3:
+                continue
+
+            # Вычисляем площадь контура с помощью OpenCV
+            contour_array = np.array(
+                points_for_area, dtype=np.float32).reshape((-1, 1, 2))
+            area = cv2.contourArea(contour_array)
+
+            # Обновляем метрики площадей
+            min_area = min(min_area, area)
+            max_area = max(max_area, area)
+            total_area += area
+
+        # Если не нашли ни одного валидного контура
+        if min_area == float('inf'):
+            return None, None, None
+
+        return min_area, max_area, total_area
 
     def _calculate_bounds(self) -> Tuple[float, float, float, float]:
         """Вычисление границ платы по контурам."""
         if not self.contours:
             return (0.0, 0.0, 0.0, 0.0)
-        
+
         all_points = [p for contour in self.contours for p in contour]
         xs = [p.x for p in all_points]
         ys = [p.y for p in all_points]
@@ -173,7 +212,8 @@ class GerberProcessor:
         if match:
             params = [float(p) for p in re.findall(r'[\d.]+', match.group(3))]
             code = int(match.group(1))
-            self.apertures[code] = Aperture(code=code, type=match.group(2), parameters=params)
+            self.apertures[code] = Aperture(
+                code=code, type=match.group(2), parameters=params)
 
     def _parse_coordinate_command(self, line: str) -> None:
         """Разбор команд с координатами."""
@@ -201,11 +241,11 @@ class GerberProcessor:
         """Извлечение координаты из строки."""
         if axis not in line:
             return None
-        
+
         m = re.search(fr'{axis}([+-]?\d+)', line)
         if not m:
             return None
-        
+
         raw = int(m.group(1))
         decimals = self.format_spec[axis.lower()][1]
         return raw / (10 ** decimals)
@@ -230,22 +270,23 @@ class GerberProcessor:
         """Проверка, является ли строка выбором апертуры."""
         if ('D' not in line) or any(c in line for c in ('X', 'Y')):
             return False
-        
+
         stripped = line.replace('G54D', '').replace('D', '').strip('*')
         return stripped.isdigit()
 
 
-class _GerberRasterizer:
-    """Внутренний класс для преобразования контуров Gerber в изображение."""
+class GerberRasterizer:
+    """Преобразует векторные контуры Gerber в растровое изображение."""
 
     def __init__(self, contours: List[List[Point]], bounds: Tuple[float, float, float, float]):
         self.contours = contours
         self.bounds = bounds  # (xmin, ymin, xmax, ymax)
 
-    def rasterize(self, dpi: int, margin_mm: float) -> np.ndarray:
+    def render(self, dpi: int, margin_mm: float) -> np.ndarray:
         """Рендеринг контуров в бинарное изображение."""
         width_px, height_px = self._calculate_dimensions(dpi, margin_mm)
-        image = np.zeros((height_px, width_px), dtype=np.uint8)
+        # image = np.zeros((height_px, width_px), dtype=np.uint8)
+        image = np.zeros((width_px, height_px), dtype=np.uint8)
 
         for contour in self.contours:
             self._draw_contour(image, contour, dpi, margin_mm)

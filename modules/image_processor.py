@@ -5,6 +5,7 @@ from typing import Dict, Tuple, Optional, List, Union
 import cv2
 import numpy as np
 
+
 class ImageProcessor:
     """
     Предварительная обработка изображений PCB.
@@ -26,7 +27,7 @@ class ImageProcessor:
                  dpi: int = 600,
                  margin_mm: float = 2.0,
                  binary_threshold: int = 0,
-                 crop_min_area: float = 50.0,        
+                 crop_min_area: float = 50.0,
                  crop_max_area_ratio: float = 0.5):
         self.params = {
             'dpi': dpi,
@@ -56,8 +57,10 @@ class ImageProcessor:
         binary = self._binarize(gray)
         cropped = self._crop_to_content(binary)
 
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        areas = [cv2.contourArea(c) for c in contours if cv2.contourArea(c) > 10]
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        areas = [cv2.contourArea(c)
+                 for c in contours if cv2.contourArea(c) > 10]
 
         return {
             'result_image': cropped,
@@ -91,16 +94,18 @@ class ImageProcessor:
 
     def _crop_to_content(self, binary: np.ndarray) -> np.ndarray:
         """Обрезка изображения по значимым контурам."""
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return binary
 
-        padding_px = int(self.params['margin_mm'] * (self.params['dpi'] / 25.4))
+        padding_px = int(self.params['margin_mm']
+                         * (self.params['dpi'] / 25.4))
         img_area = binary.shape[0] * binary.shape[1]
         max_area = img_area * self.params['crop_max_area_ratio']
 
-        valid = [c for c in contours 
-                if self.params['crop_min_area'] < cv2.contourArea(c) < max_area]
+        valid = [c for c in contours
+                 if self.params['crop_min_area'] < cv2.contourArea(c) < max_area]
         use_contours = valid if valid else contours
 
         x, y, w, h = cv2.boundingRect(np.vstack(use_contours))
@@ -110,3 +115,19 @@ class ImageProcessor:
         y2 = min(binary.shape[0], y + h + padding_px)
 
         return binary[y1:y2, x1:x2]
+
+    def validate_preprocessing(self, processed_image: np.ndarray,
+                               gerber_metrics: Dict) -> Dict:
+        """Валидация результатов предобработки относительно Gerber."""
+        # Проверка количества контуров
+        contours, _ = cv2.findContours(
+            processed_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        validation_result = {
+            'contour_count': len(contours),
+            'contour_count_ok': len(contours) >= gerber_metrics.get('contour_count', 0) * 0.5,
+            'size_match_ok': False,
+            'rotation_detected': False
+        }
+
+        return validation_result

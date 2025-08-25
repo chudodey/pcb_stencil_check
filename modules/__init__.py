@@ -1,19 +1,36 @@
 """
 Модули системы контроля качества трафаретов
 """
-from .utils import SessionLogger, ConfigManager, UserInterface
 
-from .gerber_processor import GerberProcessor
+# Импорты основных классов
+from .config_manager import ConfigManager
+from .session_logger import SessionLogger
+from .user_interface import UserInterface
+from .file_handler import FileHandler
+from .error_handler import ErrorHandler
+
+# Импорты процессоров
+from .gerber_processor import GerberProcessor, GerberRasterizer
 from .image_processor import ImageProcessor
 from .alignment_engine import AlignmentEngine
 
+# Импорты dataclasses (опционально, если нужны напрямую)
+from .data_models import EnsureDirResult, ScanResult, OrderLog, SessionData
+
 __all__ = [
     'ConfigManager',
-    'GerberProcessor', 
+    'SessionLogger',
+    'UserInterface',
+    'FileHandler',
+    'ErrorHandler',
+    'GerberProcessor',
+    'GerberRasterizer',
     'ImageProcessor',
     'AlignmentEngine',
-    'SessionLogger',
-    'UserInterface'
+    'EnsureDirResult',
+    'ScanResult',
+    'OrderLog',
+    'SessionData'
 ]
 
 __version__ = '1.0.0'
